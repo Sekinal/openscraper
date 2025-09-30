@@ -11,6 +11,7 @@ from crawlee.proxy_configuration import ProxyConfiguration
 from crawlee import Request
 from crawlee.storages import Dataset
 from crawlee import ConcurrencySettings
+from crawlee.fingerprint_suite import DefaultFingerprintGenerator, HeaderGeneratorOptions
 
 from .config import HarvesterConfig
 from .utils import logger, sanitize_filename
@@ -31,7 +32,11 @@ class GoogleSERPHarvester:
                 proxy_urls=config.proxy_urls
             )
             logger.info(f"Configured {len(config.proxy_urls)} proxies")
-    
+
+        self.fingerprint_generator = DefaultFingerprintGenerator(
+            header_options=HeaderGeneratorOptions(browsers=['chrome'])
+        )
+        
     def _build_google_url(self, keyword: str, start: int = 0) -> str:
         """Build Google search URL with parameters."""
         params = {
@@ -82,39 +87,42 @@ class GoogleSERPHarvester:
         page, 
         request: Request
     ) -> Dict[str, Any]:
-        """Extract search results from Google SERP."""
+        """Extract search results from Google SERP with enhanced cleaning."""
         from datetime import datetime
+        from urllib.parse import urlparse
         
         keyword = request.user_data.get('keyword', '')
         
-        # Extract organic search results with updated selectors
+        # Extract organic search results with better validation
         organic_results = await page.evaluate('''() => {
             const results = [];
-            
-            // Updated selector for 2025 Google SERP structure
-            // Try multiple selectors as Google frequently changes them
             const searchResults = document.querySelectorAll('.tF2Cxc, .Ww4FFb');
             
             searchResults.forEach((result) => {
                 try {
-                    // Extract URL - look for the main link
                     const linkElement = result.querySelector('a[href]:not([role="button"])');
                     const url = linkElement ? linkElement.href : null;
                     
-                    // Extract title - multiple possible selectors
                     const titleElement = result.querySelector('h3.LC20lb, h3.DKV0Md, h3');
-                    const title = titleElement ? titleElement.textContent : null;
+                    const title = titleElement ? titleElement.textContent.trim() : null;
                     
-                    // Extract description/snippet - updated selectors
                     const descElement = result.querySelector('.VwiC3b, .yXK7lf, .lEBKkf, [data-sncf="1"]');
-                    const description = descElement ? descElement.textContent : null;
+                    const description = descElement ? descElement.textContent.trim() : null;
                     
-                    // Only add if we have both URL and title
-                    if (url && title && url.startsWith('http')) {
+                    // Extract domain
+                    let domain = null;
+                    try {
+                        const urlObj = new URL(url);
+                        domain = urlObj.hostname.replace('www.', '');
+                    } catch (e) {}
+                    
+                    // Only add valid results
+                    if (url && title && url.startsWith('http') && !url.includes('google.com')) {
                         results.push({
                             url: url,
                             title: title,
-                            description: description,
+                            description: description || '',
+                            domain: domain,
                             position: results.length + 1
                         });
                     }
@@ -126,46 +134,57 @@ class GoogleSERPHarvester:
             return results;
         }''')
         
-        # Extract related keywords/suggestions with updated selectors
+        # Extract ACTUAL related keywords (bottom of page)
         related_keywords = await page.evaluate('''() => {
             const keywords = [];
             
-            // Updated selectors for related searches
-            const relatedSearches = document.querySelectorAll(
-                '.AJLUJb .b2Rnsc a, .dg6jd, [data-sncf]'
-            );
+            // Target the actual "Related searches" section at bottom
+            const relatedSection = document.querySelectorAll('.y6Uyqe a, .k8XOCe a');
             
-            relatedSearches.forEach((el) => {
-                const text = el.textContent.trim();
-                // Filter out duplicates and empty strings
-                if (text && !keywords.includes(text) && text.length > 2) {
+            relatedSection.forEach((link) => {
+                const text = link.textContent.trim();
+                // Filter: must be short, meaningful keywords only
+                if (text && 
+                    text.length > 3 && 
+                    text.length < 100 && 
+                    !text.includes('...') &&
+                    !text.includes('—') &&
+                    !keywords.includes(text)) {
                     keywords.push(text);
                 }
             });
             
-            // Limit to unique values
-            return [...new Set(keywords)];
+            return [...new Set(keywords)].slice(0, 10); // Max 10 related
         }''')
         
-        # Extract "People also ask" questions with updated selectors
+        # Extract clean PAA questions only
         paa_questions = await page.evaluate('''() => {
             const questions = [];
             
-            // Updated selectors for PAA
-            const paaElements = document.querySelectorAll(
-                '.related-question-pair span, [data-sgrd] div[role="button"]'
-            );
+            // Target PAA container
+            const paaContainer = document.querySelectorAll('[jsname="Cpkphb"] [role="button"], .related-question-pair');
             
-            paaElements.forEach((el) => {
-                const text = el.textContent.trim();
-                // Filter meaningful questions only
-                if (text && text.includes('?') && !questions.includes(text)) {
+            paaContainer.forEach((el) => {
+                // Look for the question text specifically
+                const questionEl = el.querySelector('div[role="button"]') || el;
+                const text = questionEl.textContent.trim();
+                
+                // Must end with ? and be reasonable length
+                if (text && 
+                    text.endsWith('?') && 
+                    text.length > 10 && 
+                    text.length < 200 &&
+                    !questions.includes(text)) {
                     questions.push(text);
                 }
             });
             
-            return questions;
+            return [...new Set(questions)].slice(0, 8); // Max 8 questions
         }''')
+        
+        # Calculate additional metrics
+        results_with_description = sum(1 for r in organic_results if r.get('description'))
+        unique_domains = len(set(r.get('domain') for r in organic_results if r.get('domain')))
         
         return {
             'keyword': keyword,
@@ -174,9 +193,10 @@ class GoogleSERPHarvester:
             'related_keywords': related_keywords,
             'people_also_ask': paa_questions,
             'total_results': len(organic_results),
+            'results_with_description': results_with_description,
+            'unique_domains': unique_domains,
             'scraped_at': datetime.now().isoformat()
         }
-
     
     async def scrape(
         self, 
@@ -205,10 +225,14 @@ class GoogleSERPHarvester:
             headless=self.config.headless,
             browser_type=self.config.browser_type,
             max_requests_per_crawl=self.config.max_requests,
-            concurrency_settings=concurrency_settings,  # Fixed: use concurrency_settings
+            concurrency_settings=concurrency_settings,
             request_handler=self._handle_search_page,
             proxy_configuration=self.proxy_config,
-            request_handler_timeout=timedelta(seconds=self.config.request_timeout / 1000),  # Fixed: use timedelta
+            request_handler_timeout=timedelta(seconds=self.config.request_timeout / 1000),
+            browser_launch_options={
+                'args': ['--disable-blink-features=AutomationControlled']
+            },
+            fingerprint_generator=self.fingerprint_generator  # Add this
         )
         
         # Generate requests for all keywords and pages

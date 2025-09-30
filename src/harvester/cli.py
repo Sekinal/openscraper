@@ -2,11 +2,15 @@
 import asyncio
 from pathlib import Path
 from typing import Optional, List
+from collections import Counter
+import json
+import csv
 
 import click
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.panel import Panel
 
 from .config import HarvesterConfig
 from .scraper import GoogleSERPHarvester
@@ -110,8 +114,6 @@ def scrape(
     concurrency: int
 ):
     """Scrape Google SERP for URLs and keywords."""
-    import json
-    import csv
     
     # Load keywords
     keyword_list = list(keywords)
@@ -193,8 +195,8 @@ def scrape(
                 # Save based on format
                 if format == 'json':
                     filepath = output_dir / f"{output_name}.json"
-                    with open(filepath, 'w') as f:
-                        json.dump(results, f, indent=2)
+                    with open(filepath, 'w', encoding='utf-8') as f:
+                        json.dump(results, f, indent=2, ensure_ascii=False)
                 elif format == 'csv':
                     filepath = output_dir / f"{output_name}.csv"
                     # Flatten the nested structure
@@ -204,31 +206,106 @@ def scrape(
                             'keyword': item.get('keyword'),
                             'url': item.get('url'),
                             'total_results': item.get('total_results'),
+                            'results_with_description': item.get('results_with_description', 0),
+                            'unique_domains': item.get('unique_domains', 0),
                             'scraped_at': item.get('scraped_at'),
-                            'organic_results': json.dumps(item.get('organic_results', [])),
-                            'related_keywords': json.dumps(item.get('related_keywords', [])),
-                            'people_also_ask': json.dumps(item.get('people_also_ask', []))
+                            'organic_results': json.dumps(item.get('organic_results', []), ensure_ascii=False),
+                            'related_keywords': json.dumps(item.get('related_keywords', []), ensure_ascii=False),
+                            'people_also_ask': json.dumps(item.get('people_also_ask', []), ensure_ascii=False)
                         }
                         flat_results.append(flat_item)
                     
-                    with open(filepath, 'w', newline='') as f:
+                    with open(filepath, 'w', newline='', encoding='utf-8') as f:
                         if flat_results:
                             writer = csv.DictWriter(f, fieldnames=flat_results[0].keys())
                             writer.writeheader()
                             writer.writerows(flat_results)
                 elif format == 'jsonl':
                     filepath = output_dir / f"{output_name}.jsonl"
-                    with open(filepath, 'w') as f:
+                    with open(filepath, 'w', encoding='utf-8') as f:
                         for item in results:
-                            f.write(json.dumps(item) + '\n')
+                            f.write(json.dumps(item, ensure_ascii=False) + '\n')
                 
                 logger.info(f"Results exported to: {filepath}")
         
-        # Display summary
+        # Display summary and analytics
         console.print(f"\n[green]✓[/green] Scraping complete!")
         if filepath:
             console.print(f"Results saved to: [cyan]{filepath}[/cyan]")
-        console.print(f"Total results: [yellow]{len(results)}[/yellow]")
+        
+        # Enhanced Analytics Dashboard
+        if results:
+            console.print(f"\n[bold cyan]📊 Scraping Analytics[/bold cyan]")
+            
+            # Calculate metrics
+            total_organic = sum(len(r.get('organic_results', [])) for r in results)
+            avg_per_keyword = total_organic / len(results) if results else 0
+            total_related = sum(len(r.get('related_keywords', [])) for r in results)
+            total_paa = sum(len(r.get('people_also_ask', [])) for r in results)
+            
+            # Create metrics table
+            metrics_table = Table(show_header=False, box=None)
+            metrics_table.add_column(style="cyan")
+            metrics_table.add_column(style="yellow")
+            
+            metrics_table.add_row("  Total URLs harvested:", f"{total_organic}")
+            metrics_table.add_row("  Average per keyword:", f"{avg_per_keyword:.1f}")
+            metrics_table.add_row("  Related keywords found:", f"{total_related}")
+            metrics_table.add_row("  'People Also Ask' questions:", f"{total_paa}")
+            
+            console.print(metrics_table)
+            
+            # Show domain distribution
+            all_domains = []
+            for r in results:
+                all_domains.extend([
+                    o.get('domain') for o in r.get('organic_results', []) 
+                    if o.get('domain')
+                ])
+            
+            if all_domains:
+                top_domains = Counter(all_domains).most_common(5)
+                
+                console.print(f"\n[bold cyan]🌐 Top Domains:[/bold cyan]")
+                domain_table = Table(show_header=False, box=None)
+                domain_table.add_column(style="white")
+                domain_table.add_column(style="green", justify="right")
+                
+                for domain, count in top_domains:
+                    domain_table.add_row(f"  {domain}", str(count))
+                
+                console.print(domain_table)
+            
+            # Show keyword summary
+            console.print(f"\n[bold cyan]🔑 Keywords Summary:[/bold cyan]")
+            keyword_table = Table(show_header=True, box=None)
+            keyword_table.add_column("Keyword", style="white")
+            keyword_table.add_column("URLs", style="green", justify="right")
+            keyword_table.add_column("Related", style="blue", justify="right")
+            keyword_table.add_column("PAA", style="magenta", justify="right")
+            
+            for r in results[:10]:  # Show first 10 keywords
+                keyword_table.add_row(
+                    f"  {r.get('keyword', 'N/A')[:40]}...",
+                    str(len(r.get('organic_results', []))),
+                    str(len(r.get('related_keywords', []))),
+                    str(len(r.get('people_also_ask', [])))
+                )
+            
+            console.print(keyword_table)
+            
+            if len(results) > 10:
+                console.print(f"\n  [dim]... and {len(results) - 10} more keywords[/dim]")
+            
+            # Success message in a panel
+            success_panel = Panel(
+                f"[green]Successfully harvested {total_organic} URLs from {len(results)} keywords![/green]",
+                title="[bold]✨ Complete[/bold]",
+                border_style="green"
+            )
+            console.print(f"\n{success_panel}")
+        else:
+            console.print(f"[yellow]⚠[/yellow]  No results found")
     
     # Run async scraper
     try:
@@ -268,7 +345,117 @@ def validate():
     else:
         console.print(f"[yellow]![/yellow] Output directory will be created: {output_dir}")
     
+    # Check dependencies
+    console.print("\n[cyan]Checking dependencies...[/cyan]")
+    dependencies = [
+        ('click', 'CLI framework'),
+        ('rich', 'Console formatting'),
+        ('pydantic', 'Configuration validation'),
+        ('aiofiles', 'Async file operations'),
+    ]
+    
+    for module, description in dependencies:
+        try:
+            __import__(module)
+            console.print(f"[green]✓[/green] {description} ({module})")
+        except ImportError:
+            console.print(f"[red]✗[/red] {description} ({module}) - Missing")
+    
     console.print("\n[green]Validation complete![/green]")
+
+
+@cli.command()
+@click.argument('results_file', type=click.Path(exists=True))
+def analyze(results_file: str):
+    """Analyze previously scraped results from a JSON file."""
+    console.print(f"[cyan]Analyzing results from:[/cyan] {results_file}\n")
+    
+    try:
+        with open(results_file, 'r', encoding='utf-8') as f:
+            results = json.load(f)
+        
+        if not results:
+            console.print("[yellow]No results found in file[/yellow]")
+            return
+        
+        # Calculate comprehensive metrics
+        total_organic = sum(len(r.get('organic_results', [])) for r in results)
+        total_related = sum(len(r.get('related_keywords', [])) for r in results)
+        total_paa = sum(len(r.get('people_also_ask', [])) for r in results)
+        
+        # Domain analysis
+        all_domains = []
+        all_urls = []
+        for r in results:
+            for org_result in r.get('organic_results', []):
+                domain = org_result.get('domain')
+                url = org_result.get('url')
+                if domain:
+                    all_domains.append(domain)
+                if url:
+                    all_urls.append(url)
+        
+        unique_domains = len(set(all_domains))
+        unique_urls = len(set(all_urls))
+        
+        # Display comprehensive analytics
+        console.print("[bold]📊 Analysis Results[/bold]\n")
+        
+        stats_table = Table(title="Overview Statistics")
+        stats_table.add_column("Metric", style="cyan")
+        stats_table.add_column("Value", style="yellow", justify="right")
+        
+        stats_table.add_row("Total Keywords", str(len(results)))
+        stats_table.add_row("Total URLs Harvested", str(total_organic))
+        stats_table.add_row("Unique URLs", str(unique_urls))
+        stats_table.add_row("Unique Domains", str(unique_domains))
+        stats_table.add_row("Related Keywords", str(total_related))
+        stats_table.add_row("People Also Ask", str(total_paa))
+        stats_table.add_row("Avg URLs/Keyword", f"{total_organic/len(results):.1f}")
+        
+        console.print(stats_table)
+        
+        # Top domains
+        if all_domains:
+            console.print("\n[bold]🌐 Top 10 Domains[/bold]\n")
+            top_domains = Counter(all_domains).most_common(10)
+            
+            domain_table = Table()
+            domain_table.add_column("Rank", style="dim")
+            domain_table.add_column("Domain", style="cyan")
+            domain_table.add_column("Count", style="green", justify="right")
+            domain_table.add_column("Percentage", style="yellow", justify="right")
+            
+            for idx, (domain, count) in enumerate(top_domains, 1):
+                percentage = (count / total_organic) * 100
+                domain_table.add_row(
+                    str(idx),
+                    domain,
+                    str(count),
+                    f"{percentage:.1f}%"
+                )
+            
+            console.print(domain_table)
+        
+        # Keywords with most results
+        console.print("\n[bold]🔥 Keywords with Most Results[/bold]\n")
+        keyword_results = [(r.get('keyword'), len(r.get('organic_results', []))) for r in results]
+        top_keywords = sorted(keyword_results, key=lambda x: x[1], reverse=True)[:10]
+        
+        keyword_table = Table()
+        keyword_table.add_column("Rank", style="dim")
+        keyword_table.add_column("Keyword", style="cyan")
+        keyword_table.add_column("URLs", style="green", justify="right")
+        
+        for idx, (keyword, count) in enumerate(top_keywords, 1):
+            keyword_table.add_row(str(idx), keyword[:50], str(count))
+        
+        console.print(keyword_table)
+        
+    except json.JSONDecodeError:
+        console.print("[red]Error:[/red] Invalid JSON file")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
 
 
 if __name__ == "__main__":

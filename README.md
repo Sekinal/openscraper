@@ -1,5 +1,3 @@
-Based on the comprehensive codebase analysis, here's a simple, professional README for the openscraper project:
-
 # openscraper
 
 A production-grade Google SERP scraper and keyword harvester built with Python, Crawlee, and Playwright.

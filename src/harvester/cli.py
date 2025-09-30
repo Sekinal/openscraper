@@ -316,6 +316,289 @@ def scrape(
         console.print(f"[red]Error:[/red] {e}")
         logger.exception("Scraping failed")
 
+@cli.command()
+@click.option(
+    '-k', '--keywords',
+    multiple=True,
+    help='Seed keywords for expansion (can be specified multiple times)'
+)
+@click.option(
+    '-f', '--keywords-file',
+    type=click.Path(exists=True),
+    help='File containing seed keywords (one per line)'
+)
+@click.option(
+    '--language',
+    default='en',
+    help='Language code (e.g., en, es, de, fr)'
+)
+@click.option(
+    '--country',
+    default='us',
+    help='Country code (e.g., us, uk, de, fr)'
+)
+@click.option(
+    '--domain',
+    type=click.Choice(['web', 'youtube'], case_sensitive=False),
+    default='web',
+    help='Domain to target (web=Google Search, youtube=YouTube)'
+)
+@click.option(
+    '--max-depth',
+    default=2,
+    type=int,
+    help='Maximum recursion depth for keyword expansion'
+)
+@click.option(
+    '--min-relevance',
+    default=0,
+    type=int,
+    help='Minimum relevance score to keep suggestions'
+)
+@click.option(
+    '--max-suggestions',
+    default=100,
+    type=int,
+    help='Maximum suggestions to generate per seed keyword'
+)
+@click.option(
+    '--alphabet/--no-alphabet',
+    default=True,
+    help='Use alphabet modifiers (a-z) for expansion'
+)
+@click.option(
+    '--questions/--no-questions',
+    default=True,
+    help='Use question words (how, what, why, etc.) for expansion'
+)
+@click.option(
+    '--prepositions/--no-prepositions',
+    default=True,
+    help='Use prepositions (for, with, near, etc.) for expansion'
+)
+@click.option(
+    '--recursive/--no-recursive',
+    default=True,
+    help='Enable recursive expansion of discovered keywords'
+)
+@click.option(
+    '--delay',
+    default=0.5,
+    type=float,
+    help='Delay between API requests (seconds)'
+)
+@click.option(
+    '-o', '--output',
+    help='Output filename (without extension)'
+)
+@click.option(
+    '--format',
+    type=click.Choice(['json', 'csv', 'txt'], case_sensitive=False),
+    default='json',
+    help='Export format'
+)
+def harvest(
+    keywords: tuple,
+    keywords_file: Optional[str],
+    language: str,
+    country: str,
+    domain: str,
+    max_depth: int,
+    min_relevance: int,
+    max_suggestions: int,
+    alphabet: bool,
+    questions: bool,
+    prepositions: bool,
+    recursive: bool,
+    delay: float,
+    output: Optional[str],
+    format: str
+):
+    """Harvest keywords using Google Autocomplete API."""
+    from .keyword_harvester import KeywordHarvester
+    from pathlib import Path
+    from datetime import datetime
+    
+    # Load keywords
+    keyword_list = list(keywords)
+    if keywords_file:
+        keyword_list.extend(load_keywords_from_file(keywords_file))
+    
+    if not keyword_list:
+        console.print(
+            "[red]Error:[/red] No seed keywords provided. "
+            "Use -k or --keywords-file"
+        )
+        return
+    
+    # Display configuration
+    table = Table(title="Keyword Harvester Configuration")
+    table.add_column("Setting", style="cyan")
+    table.add_column("Value", style="green")
+    
+    table.add_row("Seed Keywords", str(len(keyword_list)))
+    table.add_row("Language", language)
+    table.add_row("Country", country.upper())
+    table.add_row("Domain", domain)
+    table.add_row("Max Depth", str(max_depth))
+    table.add_row("Min Relevance", str(min_relevance))
+    table.add_row("Recursive", str(recursive))
+    table.add_row("Alphabet Expansion", str(alphabet))
+    table.add_row("Question Words", str(questions))
+    table.add_row("Prepositions", str(prepositions))
+    table.add_row("Rate Limit Delay", f"{delay}s")
+    table.add_row("Export Format", format)
+    
+    console.print(table)
+    
+    # Initialize harvester
+    domain_specific = 'yt' if domain.lower() == 'youtube' else None
+    
+    harvester = KeywordHarvester(
+        language=language,
+        country=country,
+        domain_specific=domain_specific,
+        max_depth=max_depth,
+        min_relevance=min_relevance,
+        rate_limit_delay=delay,
+        max_suggestions_per_seed=max_suggestions
+    )
+    
+    # Run harvester
+    async def run_harvest():
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console
+        ) as progress:
+            task = progress.add_task(
+                "Harvesting keywords...",
+                total=None
+            )
+            
+            results = await harvester.harvest_keywords(
+                seed_keywords=keyword_list,
+                use_alphabet=alphabet,
+                use_questions=questions,
+                use_prepositions=prepositions,
+                recursive=recursive
+            )
+            
+            progress.update(task, description="Exporting results...")
+            
+            # Generate filename
+            if not output:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_name = f"keywords_{timestamp}"
+            else:
+                output_name = output
+            
+            # Create output directory
+            output_dir = Path("data/keywords")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Export based on format
+            if format == 'json':
+                filepath = output_dir / f"{output_name}.json"
+                harvester.export_to_json(str(filepath))
+            elif format == 'csv':
+                filepath = output_dir / f"{output_name}.csv"
+                harvester.export_to_csv(str(filepath))
+            elif format == 'txt':
+                filepath = output_dir / f"{output_name}.txt"
+                harvester.export_to_txt(str(filepath), include_metadata=True)
+            
+            return filepath, results
+    
+    # Execute harvest
+    try:
+        filepath, results = asyncio.run(run_harvest())
+        
+        # Display results
+        console.print(f"\n[green]✓[/green] Harvest complete!")
+        console.print(f"Results saved to: [cyan]{filepath}[/cyan]\n")
+        
+        # Display statistics
+        stats = harvester.get_statistics()
+
+        if stats.get('total_keywords', 0) == 0:
+            console.print("\n[yellow]⚠[/yellow]  No keywords harvested")
+            console.print("This may be due to:")
+            console.print("  • Rate limiting or blocking by Google")
+            console.print("  • Network connectivity issues")
+            console.print("  • Invalid seed keywords")
+            console.print("\nTry:")
+            console.print("  • Increasing --delay to 1.0 or higher")
+            console.print("  • Using different seed keywords")
+            console.print("  • Checking your network connection")
+            return
+
+        console.print("[bold cyan]📊 Harvest Statistics[/bold cyan]\n")
+
+        stats_table = Table(show_header=False, box=None)
+        stats_table.add_column(style="cyan")
+        stats_table.add_column(style="yellow")
+
+        stats_table.add_row("  Total keywords discovered:", f"{stats['total_keywords']}")
+        stats_table.add_row("  Unique keywords:", f"{stats['unique_keywords']}")
+        stats_table.add_row("  Average relevance score:", f"{stats['average_relevance']}")
+        stats_table.add_row("  Average keyword length:", f"{stats['average_keyword_length']} chars")
+        stats_table.add_row("  Average word count:", f"{stats['average_word_count']} words")
+        stats_table.add_row("  Long-tail keywords (3+ words):", f"{stats['long_tail_percentage']}%")
+
+        console.print(stats_table)
+        
+        # Depth distribution
+        if stats.get('depth_distribution'):
+            console.print(f"\n[bold cyan]🌳 Depth Distribution:[/bold cyan]")
+            depth_table = Table(show_header=True, box=None)
+            depth_table.add_column("Depth", style="white")
+            depth_table.add_column("Keywords", style="green", justify="right")
+            depth_table.add_column("Percentage", style="blue", justify="right")
+            
+            total = sum(stats['depth_distribution'].values())
+            for depth, count in sorted(stats['depth_distribution'].items()):
+                percentage = (count / total * 100) if total > 0 else 0
+                depth_table.add_row(
+                    f"  Level {depth}",
+                    str(count),
+                    f"{percentage:.1f}%"
+                )
+            
+            console.print(depth_table)
+        
+        # Top keywords
+        if stats.get('top_keywords'):
+            console.print(f"\n[bold cyan]🔥 Top 10 Keywords (by relevance):[/bold cyan]")
+            top_table = Table(show_header=True, box=None)
+            top_table.add_column("Rank", style="dim")
+            top_table.add_column("Keyword", style="white")
+            top_table.add_column("Relevance", style="green", justify="right")
+            top_table.add_column("Depth", style="blue", justify="right")
+            
+            for idx, kw in enumerate(stats['top_keywords'][:10], 1):
+                top_table.add_row(
+                    str(idx),
+                    f"  {kw['keyword'][:60]}",
+                    str(kw['relevance']),
+                    str(kw['depth'])
+                )
+            
+            console.print(top_table)
+        
+        # Success panel
+        success_panel = Panel(
+            f"[green]Successfully harvested {stats['total_keywords']} keywords from {len(keyword_list)} seeds![/green]",
+            title="[bold]✨ Complete[/bold]",
+            border_style="green"
+        )
+        console.print(f"\n{success_panel}")
+        
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Harvest interrupted by user[/yellow]")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        logger.exception("Harvest failed")
 
 @cli.command()
 def validate():

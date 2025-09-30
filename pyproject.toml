@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "aiofiles>=24.1.0",
+    "aiohttp>=3.12.15",
     "click>=8.3.0",
     "crawlee[playwright]>=1.0.0",
     "pydantic>=2.11.9",

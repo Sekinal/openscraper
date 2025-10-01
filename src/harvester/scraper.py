@@ -26,6 +26,8 @@ class GoogleSERPHarvester:
         self.proxy_config: Optional[ProxyConfiguration] = None
         self.results: List[Dict[str, Any]] = []
         
+        self.dataset_name = 'serp-results-persistent'
+
         # Setup proxy if configured
         if config.proxy_urls and len(config.proxy_urls) > 0:
             self.proxy_config = ProxyConfiguration(
@@ -48,39 +50,38 @@ class GoogleSERPHarvester:
         base_url = f"https://www.{self.config.google_domain}/search"
         return f"{base_url}?{urlencode(params)}"
     
-    async def _handle_search_page(
-        self, 
-        context: PlaywrightCrawlingContext
-    ) -> None:
-        """Handle individual search result page."""
+    async def _handle_search_page(self, context: PlaywrightCrawlingContext) -> None:
+        """Handle individual search result page with streaming storage."""
         page = context.page
         request = context.request
         
         try:
-            # Wait for search results to load (Google requires JS rendering)
-            await page.wait_for_selector('#search', timeout=30000)
+            await page.wait_for_selector("#search", timeout=30000)
             
-            # Extract organic results
+            # Extract and immediately push (streaming)
             results = await self._extract_results(page, request)
             
-            # Store results
+            # Push directly to dataset (no in-memory accumulation)
             await context.push_data(results)
             
-            # Add delay to mimic human behavior
-            delay = random.uniform(
-                self.config.min_delay, 
-                self.config.max_delay
-            )
-            await asyncio.sleep(delay)
-            
             logger.info(
-                f"Extracted {len(results.get('organic_results', []))} results from: "
-                f"{request.user_data.get('keyword', 'unknown')}"
+                f"Extracted {len(results.get('organic_results', []))} results "
+                f"from {request.user_data.get('keyword', 'unknown')}"
             )
+            
+            # Rate limiting
+            delay = random.uniform(self.config.min_delay, self.config.max_delay)
+            await asyncio.sleep(delay)
             
         except Exception as e:
             logger.error(f"Error processing {request.url}: {e}")
             context.log.error(f"Failed to process page: {e}")
+            # Push error record for tracking
+            await context.push_data({
+                "keyword": request.user_data.get('keyword'),
+                "error": str(e),
+                "url": request.url
+            })
     
     async def _extract_results(
         self, 
@@ -220,7 +221,7 @@ class GoogleSERPHarvester:
             desired_concurrency=self.config.max_concurrency
         )
         
-        # Create crawler instance with corrected parameters
+        # Create crawler instance
         crawler = PlaywrightCrawler(
             headless=self.config.headless,
             browser_type=self.config.browser_type,
@@ -232,7 +233,7 @@ class GoogleSERPHarvester:
             browser_launch_options={
                 'args': ['--disable-blink-features=AutomationControlled']
             },
-            fingerprint_generator=self.fingerprint_generator  # Add this
+            fingerprint_generator=self.fingerprint_generator
         )
         
         # Generate requests for all keywords and pages
@@ -260,53 +261,71 @@ class GoogleSERPHarvester:
         # Run crawler
         await crawler.run(requests)
         
-        # Get results from dataset
-        dataset = await Dataset.open()
-        results = await dataset.get_data()
+        # Get results from default dataset (where context.push_data() stores them)
+        dataset = await Dataset.open()  # Opens default dataset
+        data = await dataset.get_data()
         
-        self.results = results.items
+        # Store results in instance variable
+        self.results = data.items if hasattr(data, 'items') else list(data)
+        
         logger.info(f"Scraping complete: {len(self.results)} results")
         
         return self.results
     
-    async def export_results(
-        self, 
-        filename: Optional[str] = None
-    ) -> Path:
-        """Export results to file."""
-        if not self.results:
-            logger.warning("No results to export")
-            return None
+    async def export_results(self, filename: Optional[str] = None) -> Path:
+        """Export results using native Crawlee Dataset methods."""
         
         # Create output directory
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Generate filename if not provided
+        # Generate filename
         if not filename:
             from datetime import datetime
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"serp_results_{timestamp}"
         
         filename = sanitize_filename(filename)
+        filepath = output_dir / f"{filename}.{self.config.export_format}"
+        
+        # Get the dataset that context.push_data() writes to
+        dataset = await Dataset.open()  # Opens the default dataset
+        
+        # Get all data from dataset
+        data = await dataset.get_data()
+        items = data.items if hasattr(data, 'items') else list(data)
         
         # Export based on format
-        dataset = await Dataset.open()
-        
-        if self.config.export_format == "json":
-            filepath = output_dir / f"{filename}.json"
-            await dataset.export_to_json(str(filepath))
-        elif self.config.export_format == "csv":
-            filepath = output_dir / f"{filename}.csv"
-            await dataset.export_to_csv(str(filepath))
-        elif self.config.export_format == "jsonl":
-            filepath = output_dir / f"{filename}.jsonl"
-            # Export as JSON Lines
-            import aiofiles
-            async with aiofiles.open(filepath, 'w') as f:
-                import json
-                for item in self.results:
-                    await f.write(json.dumps(item) + '\n')
+        if self.config.export_format == 'json':
+            import json
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(items, f, indent=2, ensure_ascii=False)
+        elif self.config.export_format == 'csv':
+            import csv
+            if items:
+                with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=items[0].keys())
+                    writer.writeheader()
+                    writer.writerows(items)
         
         logger.info(f"Results exported to: {filepath}")
         return filepath
+
+    async def get_dataset_stats(self) -> Dict[str, Any]:
+        """Get statistics about the persistent dataset."""
+        dataset = await Dataset.open(name=self.dataset_name)
+        info = await dataset.get_info()
+        
+        return {
+            "total_items": info.item_count,
+            "dataset_name": info.name,
+            "created_at": info.created_at,
+            "modified_at": info.modified_at,
+            "access_count": info.accessed_at
+        }
+
+    async def clear_dataset(self) -> None:
+        """Manually clear the persistent dataset."""
+        dataset = await Dataset.open(name=self.dataset_name)
+        await dataset.drop()
+        logger.info(f"Dataset '{self.dataset_name}' cleared")

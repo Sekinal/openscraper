@@ -19,6 +19,10 @@ class HarvesterConfig(BaseSettings):
     headless: bool = Field(default=True)
     browser_type: str = Field(default="chromium")
     request_timeout: int = Field(default=60000)  # milliseconds
+
+    # Storage configuration
+    purge_on_start: bool = Field(default=False, description="Clear storage before scraping")
+    dataset_name: str = Field(default="serp-results", description="Named dataset identifier")
     
     # Proxy settings
     proxy_urls: Optional[List[str]] = Field(default=None)

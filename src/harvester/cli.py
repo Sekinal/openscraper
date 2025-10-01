@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
+from crawlee.storages import Dataset
 
 from .config import HarvesterConfig
 from .scraper import GoogleSERPHarvester
@@ -98,6 +99,11 @@ def cli():
     type=int,
     help='Maximum concurrent requests'
 )
+@click.option(
+    '--purge/--no-purge',
+    default=False,
+    help='Purge dataset before scraping (default: no-purge for incremental)'
+)
 def scrape(
     keywords: tuple,
     keywords_file: Optional[str],
@@ -111,7 +117,8 @@ def scrape(
     format: str,
     min_delay: float,
     max_delay: float,
-    concurrency: int
+    concurrency: int,
+    purge: bool
 ):
     """Scrape Google SERP for URLs and keywords."""
     
@@ -145,6 +152,7 @@ def scrape(
     table.add_row("Concurrency", str(concurrency))
     table.add_row("Delay", f"{min_delay}s - {max_delay}s")
     table.add_row("Export format", format)
+    table.add_row("Purge on start", str(purge))
     
     console.print(table)
     
@@ -157,7 +165,8 @@ def scrape(
         min_delay=min_delay,
         max_delay=max_delay,
         max_concurrency=concurrency,
-        export_format=format
+        export_format=format,
+        purge_on_start=purge
     )
     
     # Run scraper
@@ -169,69 +178,26 @@ def scrape(
             TextColumn("[progress.description]{task.description}"),
             console=console
         ) as progress:
-            task = progress.add_task(
-                "Scraping Google SERP...", 
-                total=None
-            )
+            task = progress.add_task("Scraping Google SERP...", total=None)
             
+            # Run the scraper (this stores data in Crawlee's dataset)
             results = await harvester.scrape(keyword_list, pages)
             
             progress.update(task, description="Exporting results...")
             
-            # Export results manually
-            filepath = None
-            if results:
-                # Generate filename
-                output_name = output
-                if not output_name:
-                    from datetime import datetime
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    output_name = f"serp_results_{timestamp}"
-                
-                # Create output directory
-                output_dir = Path(config.output_dir)
-                output_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Save based on format
-                if format == 'json':
-                    filepath = output_dir / f"{output_name}.json"
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        json.dump(results, f, indent=2, ensure_ascii=False)
-                elif format == 'csv':
-                    filepath = output_dir / f"{output_name}.csv"
-                    # Flatten the nested structure
-                    flat_results = []
-                    for item in results:
-                        flat_item = {
-                            'keyword': item.get('keyword'),
-                            'url': item.get('url'),
-                            'total_results': item.get('total_results'),
-                            'results_with_description': item.get('results_with_description', 0),
-                            'unique_domains': item.get('unique_domains', 0),
-                            'scraped_at': item.get('scraped_at'),
-                            'organic_results': json.dumps(item.get('organic_results', []), ensure_ascii=False),
-                            'related_keywords': json.dumps(item.get('related_keywords', []), ensure_ascii=False),
-                            'people_also_ask': json.dumps(item.get('people_also_ask', []), ensure_ascii=False)
-                        }
-                        flat_results.append(flat_item)
-                    
-                    with open(filepath, 'w', newline='', encoding='utf-8') as f:
-                        if flat_results:
-                            writer = csv.DictWriter(f, fieldnames=flat_results[0].keys())
-                            writer.writeheader()
-                            writer.writerows(flat_results)
-                elif format == 'jsonl':
-                    filepath = output_dir / f"{output_name}.jsonl"
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        for item in results:
-                            f.write(json.dumps(item, ensure_ascii=False) + '\n')
-                
-                logger.info(f"Results exported to: {filepath}")
+            # Use the harvester's export method instead of crawler's
+            filepath = await harvester.export_results(output)
+            
+        return filepath, results
+    
+    # Execute scrape
+    try:
+        filepath, results = asyncio.run(run_scraper())
         
-        # Display summary and analytics
+        # Display results
         console.print(f"\n[green]✓[/green] Scraping complete!")
         if filepath:
-            console.print(f"Results saved to: [cyan]{filepath}[/cyan]")
+            console.print(f"Results saved to [cyan]{filepath}[/cyan]")
         
         # Enhanced Analytics Dashboard
         if results:
@@ -307,14 +273,12 @@ def scrape(
         else:
             console.print(f"[yellow]⚠[/yellow]  No results found")
     
-    # Run async scraper
-    try:
-        asyncio.run(run_scraper())
     except KeyboardInterrupt:
         console.print("\n[yellow]Scraping interrupted by user[/yellow]")
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         logger.exception("Scraping failed")
+
 
 @cli.command()
 @click.option(
@@ -599,6 +563,7 @@ def harvest(
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         logger.exception("Harvest failed")
+
 
 @cli.command()
 def validate():
